@@ -124,6 +124,9 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 	}
 
 	if (ip_num == 0 && request->rcode == DNS_RC_NXDOMAIN) {
+		if (strncasecmp(request->domain, "nxdomain", DNS_MAX_CNAME_LEN - 1) == 0) {
+			return;
+		}
 		snprintf(req_result, left_len, "NXDOMAIN");
 		has_soa = 0;
 	}
