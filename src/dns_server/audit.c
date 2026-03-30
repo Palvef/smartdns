@@ -81,6 +81,7 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 	int ip_num = 0;
 	struct dns_request *request = context->request;
 	int has_soa = request->has_soa;
+	const char *rcode_str = _dns_server_audit_rcode_to_string(request->rcode);
 
 	if (atomic_read(&request->notified) == 1) {
 		request->query_time = get_tick_count() - request->send_tick;
@@ -160,17 +161,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		}
 	}
 
-	if (ip_num == 0) {
-		const char *rcode_str = _dns_server_audit_rcode_to_string(request->rcode);
-		if (rcode_str != NULL) {
-			if (request->rcode == DNS_RC_NXDOMAIN && _dns_server_audit_is_synthetic_nxdomain_query(request->domain)) {
-				return;
-			}
-      
-			snprintf(req_result, left_len, "%s", rcode_str);
-			has_soa = 0;
-	  }
-  }
+	if (request->rcode == DNS_RC_NXDOMAIN && _dns_server_audit_is_synthetic_nxdomain_query(request->domain)) {
+		return;
+	}
+
 	if (has_soa && ip_num == 0) {
 		if (!dns_conf.audit_log_SOA) {
 			return;
@@ -182,18 +176,9 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 			snprintf(req_result, left_len, "soa");
 		}
 	} else if (ip_num == 0) {
-		const char *rcode_str = _dns_server_audit_rcode_to_string(request->rcode);
-		if (rcode_str != NULL) {
-			if (request->rcode == DNS_RC_NXDOMAIN && _dns_server_audit_is_synthetic_nxdomain_query(request->domain)) {
-				return;
-			}
-
+		if (rcode_str != NULL && request->rcode != DNS_RC_NOERROR) {
 			snprintf(req_result, left_len, "%s", rcode_str);
 		}
-	}
-
-	if (ip_num == 0 && request->rcode == DNS_RC_NXDOMAIN) {
-		snprintf(req_result, left_len, "NXDOMAIN");
 	}
 
 	get_host_by_addr(req_host, sizeof(req_host), &request->addr);
@@ -208,9 +193,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 				 tm.min, tm.sec, tm.usec / 1000);
 	}
 
-	tlog_printf(dns_audit, "%s%s query %s, type %d, time %dms, speed: %.1fms, group %s, result %s\n", req_time,
+	tlog_printf(dns_audit, "%s%s query %s, type %d, time %dms, speed: %.1fms, group %s, result %s, rcode %s\n", req_time,
 				req_host, request->domain, request->qtype, request->query_time, ((float)request->ping_time) / 10,
-				request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT, req_result);
+				request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT, req_result,
+				rcode_str != NULL ? rcode_str : "UNKNOWN");
 }
 
 static int _dns_server_audit_syslog(struct tlog_log *log, const char *buff, int bufflen)
