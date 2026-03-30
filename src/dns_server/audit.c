@@ -131,6 +131,11 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		has_soa = 0;
 	}
 
+	if (ip_num == 0 && request->rcode == DNS_RC_SERVFAIL) {
+		snprintf(req_result, left_len, "SERVFAIL");
+		has_soa = 0;
+	}
+  
 	if (has_soa && ip_num == 0) {
 		if (!dns_conf.audit_log_SOA) {
 			return;
