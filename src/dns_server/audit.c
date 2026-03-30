@@ -175,6 +175,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		} else {
 			snprintf(req_result, left_len, "soa");
 		}
+	} else if (ip_num == 0) {
+		if (rcode_str != NULL && request->rcode != DNS_RC_NOERROR && request->rcode != DNS_RC_SERVFAIL) {
+			snprintf(req_result, left_len, "%s", rcode_str);
+		}
 	}
 
 	get_host_by_addr(req_host, sizeof(req_host), &request->addr);
