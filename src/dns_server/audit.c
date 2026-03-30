@@ -193,6 +193,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 				 tm.min, tm.sec, tm.usec / 1000);
 	}
 
+	if (request->rcode == DNS_RC_NXDOMAIN && strcasecmp(req_result, "NXDOMAIN") == 0) {
+		req_result[0] = '\0';
+	}
+
 	tlog_printf(dns_audit, "%s%s query %s, type %d, time %dms, speed: %.1fms, group %s, result %s, rcode %s\n", req_time,
 				req_host, request->domain, request->qtype, request->query_time, ((float)request->ping_time) / 10,
 				request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT, req_result,
