@@ -166,12 +166,11 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 			if (request->rcode == DNS_RC_NXDOMAIN && _dns_server_audit_is_synthetic_nxdomain_query(request->domain)) {
 				return;
 			}
-
+      
 			snprintf(req_result, left_len, "%s", rcode_str);
 			has_soa = 0;
-		}
-	}
-
+	  }
+  }
 	if (has_soa && ip_num == 0) {
 		if (!dns_conf.audit_log_SOA) {
 			return;
@@ -182,6 +181,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		} else {
 			snprintf(req_result, left_len, "soa");
 		}
+	}
+
+	if (ip_num == 0 && request->rcode == DNS_RC_NXDOMAIN) {
+		snprintf(req_result, left_len, "NXDOMAIN");
 	}
 
 	get_host_by_addr(req_host, sizeof(req_host), &request->addr);
