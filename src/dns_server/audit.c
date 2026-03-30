@@ -135,7 +135,7 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		snprintf(req_result, left_len, "SERVFAIL");
 		has_soa = 0;
 	}
-
+  
 	if (has_soa && ip_num == 0) {
 		if (!dns_conf.audit_log_SOA) {
 			return;
@@ -146,6 +146,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		} else {
 			snprintf(req_result, left_len, "soa");
 		}
+	}
+
+	if (ip_num == 0 && request->rcode == DNS_RC_NXDOMAIN) {
+		snprintf(req_result, left_len, "NXDOMAIN");
 	}
 
 	get_host_by_addr(req_host, sizeof(req_host), &request->addr);
