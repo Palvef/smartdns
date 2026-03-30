@@ -25,6 +25,43 @@
 
 static tlog_log *dns_audit;
 
+static const char *_dns_server_audit_rcode_to_string(int rcode)
+{
+	switch (rcode) {
+	case DNS_RC_NOERROR:
+		return "NOERROR";
+	case DNS_RC_FORMERR:
+		return "FORMERR";
+	case DNS_RC_SERVFAIL:
+		return "SERVFAIL";
+	case DNS_RC_NXDOMAIN:
+		return "NXDOMAIN";
+	case DNS_RC_NOTIMP:
+		return "NOTIMP";
+	case DNS_RC_REFUSED:
+		return "REFUSED";
+	case DNS_RC_YXDOMAIN:
+		return "YXDOMAIN";
+	case DNS_RC_YXRRSET:
+		return "YXRRSET";
+	case DNS_RC_NXRRSET:
+		return "NXRRSET";
+	case DNS_RC_NOTAUTH:
+		return "NOTAUTH";
+	case DNS_RC_NOTZONE:
+		return "NOTZONE";
+	case DNS_RC_BADVERS:
+		return "BADVERS";
+	default:
+		return NULL;
+	}
+}
+
+static int _dns_server_audit_is_synthetic_nxdomain_query(const char *domain)
+{
+	return strcasecmp(domain, "nxdomain") == 0 || strcasecmp(domain, "nxdomain.") == 0;
+}
+
 void _dns_server_audit_log(struct dns_server_post_context *context)
 {
 	char req_host[MAX_IP_LEN];
@@ -120,6 +157,18 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 
 			left_len -= len;
 			total_len += len;
+		}
+	}
+
+	if (ip_num == 0) {
+		const char *rcode_str = _dns_server_audit_rcode_to_string(request->rcode);
+		if (rcode_str != NULL) {
+			if (request->rcode == DNS_RC_NXDOMAIN && _dns_server_audit_is_synthetic_nxdomain_query(request->domain)) {
+				return;
+			}
+
+			snprintf(req_result, left_len, "%s", rcode_str);
+			has_soa = 0;
 		}
 	}
 
