@@ -148,6 +148,10 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		}
 	}
 
+	if (ip_num == 0 && request->rcode == DNS_RC_NXDOMAIN) {
+		snprintf(req_result, left_len, "NXDOMAIN");
+	}
+
 	get_host_by_addr(req_host, sizeof(req_host), &request->addr);
 	tlog_localtime(&tm);
 
