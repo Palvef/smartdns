@@ -181,6 +181,15 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		} else {
 			snprintf(req_result, left_len, "soa");
 		}
+	} else if (ip_num == 0) {
+		const char *rcode_str = _dns_server_audit_rcode_to_string(request->rcode);
+		if (rcode_str != NULL) {
+			if (request->rcode == DNS_RC_NXDOMAIN && _dns_server_audit_is_synthetic_nxdomain_query(request->domain)) {
+				return;
+			}
+
+			snprintf(req_result, left_len, "%s", rcode_str);
+		}
 	}
 
 	if (ip_num == 0 && request->rcode == DNS_RC_NXDOMAIN) {
