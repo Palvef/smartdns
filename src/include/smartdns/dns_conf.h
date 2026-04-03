@@ -765,6 +765,23 @@ struct dns_config {
 	int dns_no_daemon;
 	int dns_restart_on_crash;
 	size_t dns_socket_buff_size;
+
+	int threat_intelligence_query;
+	int threat_intelligence_fail_bypass;
+	int threat_intelligence_skip_tls;
+	char threat_intelligence_es[DNS_MAX_URL_LEN];
+	char threat_intelligence_username[DNS_MAX_CNAME_LEN];
+	char threat_intelligence_password[DNS_MAX_CNAME_LEN];
+	char threat_intelligence_ca_file[DNS_MAX_PATH];
+	char threat_intelligence_index[DNS_MAX_CNAME_LEN];
+	char threat_intelligence_block_ipv4[DNS_MAX_IPLEN];
+	char threat_intelligence_block_ipv6[DNS_MAX_IPLEN];
+	int threat_intelligence_msearch_size;
+	int threat_intelligence_cache_enable;
+	int threat_intelligence_cache_ttl;
+	int threat_intelligence_cache_size;
+	char threat_intelligence_cache_file[DNS_MAX_PATH];
+	char threat_intelligence_whitelist[DNS_MAX_PATH];
 };
 extern struct dns_config dns_conf;
 
