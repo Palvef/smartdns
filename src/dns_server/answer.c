@@ -24,6 +24,7 @@
 #include "rules.h"
 #include "soa.h"
 #include "speed_check.h"
+#include "threat_intelligence.h"
 
 #include <math.h>
 
@@ -33,6 +34,9 @@ static int _dns_server_process_answer_A_IP(struct dns_request *request, char *cn
 	char ip[DNS_MAX_CNAME_LEN] = {0};
 	int ip_check_result = 0;
 	unsigned char *paddrs[MAX_IP_NUM];
+	char ip_ioc[MAX_IP_NUM][DNS_MAX_CNAME_LEN];
+	const char *ioc_ptr[MAX_IP_NUM];
+	dns_threat_query_result threat_results[MAX_IP_NUM];
 	int paddr_num = 0;
 	struct dns_iplist_ip_addresses *alias = NULL;
 
@@ -55,7 +59,20 @@ static int _dns_server_process_answer_A_IP(struct dns_request *request, char *cn
 	}
 
 	for (int i = 0; i < paddr_num; i++) {
+		snprintf(ip_ioc[i], sizeof(ip_ioc[i]), "%d.%d.%d.%d", paddrs[i][0], paddrs[i][1], paddrs[i][2], paddrs[i][3]);
+		ioc_ptr[i] = ip_ioc[i];
+		threat_results[i] = DNS_THREAT_QUERY_SAFE;
+	}
+	_dns_server_threat_check_ips_batch(request, ioc_ptr, 0, threat_results, paddr_num);
+
+	for (int i = 0; i < paddr_num; i++) {
 		unsigned char *paddr = paddrs[i];
+		dns_threat_query_result threat_ret = threat_results[i];
+		if (threat_ret == DNS_THREAT_QUERY_MALICIOUS) {
+			request->is_blackhole = 1;
+			continue;
+		}
+
 		if (atomic_read(&request->ip_map_num) == 0) {
 			request->has_ip = 1;
 			request->ip_addr_type = DNS_T_A;
@@ -89,9 +106,11 @@ static int _dns_server_process_answer_A_IP(struct dns_request *request, char *cn
 		snprintf(ip, sizeof(ip), "%d.%d.%d.%d", paddr[0], paddr[1], paddr[2], paddr[3]);
 
 		/* start ping */
-		_dns_server_request_get(request);
-		if (_dns_server_check_speed(request, ip) != 0) {
-			_dns_server_request_release(request);
+		if (dns_conf.threat_intelligence_query == 0) {
+			_dns_server_request_get(request);
+			if (_dns_server_check_speed(request, ip) != 0) {
+				_dns_server_request_release(request);
+			}
 		}
 	}
 
@@ -124,8 +143,27 @@ static int _dns_server_process_answer_AAAA_IP(struct dns_request *request, char 
 		return ret;
 	}
 
+	char ip_ioc[MAX_IP_NUM][DNS_MAX_CNAME_LEN];
+	const char *ioc_ptr[MAX_IP_NUM];
+	dns_threat_query_result threat_results[MAX_IP_NUM];
+	for (int i = 0; i < paddr_num; i++) {
+		snprintf(ip_ioc[i], sizeof(ip_ioc[i]),
+				 "%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x", paddrs[i][0], paddrs[i][1],
+				 paddrs[i][2], paddrs[i][3], paddrs[i][4], paddrs[i][5], paddrs[i][6], paddrs[i][7], paddrs[i][8],
+				 paddrs[i][9], paddrs[i][10], paddrs[i][11], paddrs[i][12], paddrs[i][13], paddrs[i][14], paddrs[i][15]);
+		ioc_ptr[i] = ip_ioc[i];
+		threat_results[i] = DNS_THREAT_QUERY_SAFE;
+	}
+	_dns_server_threat_check_ips_batch(request, ioc_ptr, 1, threat_results, paddr_num);
+
 	for (int i = 0; i < paddr_num; i++) {
 		unsigned char *paddr = paddrs[i];
+		dns_threat_query_result threat_ret = threat_results[i];
+		if (threat_ret == DNS_THREAT_QUERY_MALICIOUS) {
+			request->is_blackhole = 1;
+			continue;
+		}
+
 		if (atomic_read(&request->ip_map_num) == 0) {
 			request->has_ip = 1;
 			request->ip_addr_type = DNS_T_AAAA;
@@ -161,9 +199,11 @@ static int _dns_server_process_answer_AAAA_IP(struct dns_request *request, char 
 				 paddr[11], paddr[12], paddr[13], paddr[14], paddr[15]);
 
 		/* start ping */
-		_dns_server_request_get(request);
-		if (_dns_server_check_speed(request, ip) != 0) {
-			_dns_server_request_release(request);
+		if (dns_conf.threat_intelligence_query == 0) {
+			_dns_server_request_get(request);
+			if (_dns_server_check_speed(request, ip) != 0) {
+				_dns_server_request_release(request);
+			}
 		}
 	}
 
