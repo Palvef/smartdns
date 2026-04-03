@@ -41,6 +41,8 @@
 #define DNS_THREAT_MAX_BATCH 2048
 #define DNS_THREAT_CACHE_TTL_MS_DEFAULT (5 * 60 * 1000)
 #define DNS_THREAT_CACHE_MAX_DEFAULT 65536
+#define DNS_THREAT_QUERY_INFLIGHT_MAX 8
+#define DNS_THREAT_QUERY_BACKOFF_MS 3000
 
 struct dns_threat_cache_entry {
 	struct hlist_node node;
@@ -71,11 +73,17 @@ static pthread_mutex_t dns_threat_whitelist_lock = PTHREAD_MUTEX_INITIALIZER;
 static DECLARE_HASHTABLE(dns_threat_whitelist, 10);
 static time_t dns_threat_whitelist_mtime;
 static int dns_threat_whitelist_loaded;
+static pthread_mutex_t dns_threat_query_lock = PTHREAD_MUTEX_INITIALIZER;
+static int dns_threat_query_inflight;
+static int dns_threat_query_fail_count;
+static unsigned long dns_threat_query_backoff_until;
 
 static uint32_t _dns_threat_cache_key(const char *ioc, int is_ip);
 static int _dns_threat_is_expired(unsigned long expired_tick);
 static void _dns_threat_whitelist_load(void);
 static int _dns_threat_is_domain_whitelisted(const char *domain);
+static int _dns_threat_query_try_enter(void);
+static void _dns_threat_query_leave(int success);
 
 static void _dns_threat_cache_init(void)
 {
@@ -201,6 +209,49 @@ static int _dns_threat_is_domain_whitelisted(const char *domain)
 	pthread_mutex_unlock(&dns_threat_whitelist_lock);
 
 	return found;
+}
+
+static int _dns_threat_query_try_enter(void)
+{
+	unsigned long now = get_tick_count();
+	int ret = 0;
+
+	pthread_mutex_lock(&dns_threat_query_lock);
+	if ((long)(dns_threat_query_backoff_until - now) > 0) {
+		ret = -1;
+		goto out;
+	}
+
+	if (dns_threat_query_inflight >= DNS_THREAT_QUERY_INFLIGHT_MAX) {
+		ret = -1;
+		goto out;
+	}
+
+	dns_threat_query_inflight++;
+out:
+	pthread_mutex_unlock(&dns_threat_query_lock);
+	return ret;
+}
+
+static void _dns_threat_query_leave(int success)
+{
+	unsigned long now = get_tick_count();
+
+	pthread_mutex_lock(&dns_threat_query_lock);
+	if (dns_threat_query_inflight > 0) {
+		dns_threat_query_inflight--;
+	}
+
+	if (success) {
+		dns_threat_query_fail_count = 0;
+		dns_threat_query_backoff_until = 0;
+	} else {
+		dns_threat_query_fail_count++;
+		if (dns_threat_query_fail_count >= 3) {
+			dns_threat_query_backoff_until = now + DNS_THREAT_QUERY_BACKOFF_MS;
+		}
+	}
+	pthread_mutex_unlock(&dns_threat_query_lock);
 }
 
 static int _dns_threat_cache_ttl_ms(void)
@@ -447,6 +498,10 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 	struct dns_threat_cache_entry *entry = NULL;
 	struct dns_threat_cache_entry *oldest = NULL;
 
+	if (result != DNS_THREAT_QUERY_MALICIOUS) {
+		return;
+	}
+
 	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
 	_dns_threat_cache_load_from_file();
 	pthread_mutex_lock(&dns_threat_cache_lock);
@@ -687,8 +742,15 @@ static int _dns_threat_query_batch_from_es(const char **ioc, int count, int is_i
 	const char *responses = NULL;
 	const char *next = NULL;
 	unsigned long start_tick = get_tick_count();
+	int enter_ok = 0;
 
 	pthread_once(&dns_threat_curl_once, _dns_threat_curl_global_init);
+	if (_dns_threat_query_try_enter() != 0) {
+		tlog(TLOG_WARN, "threat query skipped due to backend busy/backoff.");
+		goto out;
+	}
+	enter_ok = 1;
+
 	payload = _dns_threat_build_msearch_payload(ioc, count);
 	if (payload == NULL) {
 		goto out;
@@ -710,8 +772,8 @@ static int _dns_threat_query_batch_from_es(const char **ioc, int count, int is_i
 	curl_easy_setopt(curl, CURLOPT_POST, 1L);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 500L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 800L);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _dns_threat_http_write_cb);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
@@ -774,6 +836,9 @@ out:
 	}
 	if (resp.data != NULL) {
 		free(resp.data);
+	}
+	if (enter_ok) {
+		_dns_threat_query_leave(ret == 0);
 	}
 	return ret;
 }
@@ -900,7 +965,6 @@ dns_threat_query_result _dns_server_threat_check_domain(struct dns_request *requ
 
 	if (_dns_threat_is_domain_whitelisted(query_domain)) {
 		tlog(TLOG_DEBUG, "threat whitelist hit: %s", query_domain);
-		_dns_threat_cache_set(query_domain, 0, DNS_THREAT_QUERY_SAFE);
 		return DNS_THREAT_QUERY_SAFE;
 	}
 
