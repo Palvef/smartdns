@@ -23,14 +23,18 @@
 
 #include "smartdns/dns_conf.h"
 #include "smartdns/tlog.h"
+#include "smartdns/util.h"
 
+#include <arpa/inet.h>
 #include <curl/curl.h>
 #include <openssl/md5.h>
 #include <pthread.h>
 #include <errno.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define DNS_THREAT_BUF_SIZE (1024 * 1024)
 #define DNS_THREAT_MAX_BATCH 2048
@@ -47,6 +51,11 @@ struct dns_threat_cache_entry {
 	unsigned long expired_tick;
 };
 
+struct dns_threat_whitelist_entry {
+	struct hlist_node node;
+	char domain[DNS_MAX_CNAME_LEN];
+};
+
 static pthread_mutex_t dns_threat_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static DECLARE_HASHTABLE(dns_threat_cache, 10);
 static struct list_head dns_threat_cache_list;
@@ -57,15 +66,140 @@ static pthread_once_t dns_threat_cache_file_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t dns_threat_cache_file_lock = PTHREAD_MUTEX_INITIALIZER;
 static int dns_threat_cache_loaded;
 static unsigned long dns_threat_cache_last_save;
+static pthread_mutex_t dns_threat_whitelist_lock = PTHREAD_MUTEX_INITIALIZER;
+static DECLARE_HASHTABLE(dns_threat_whitelist, 10);
+static time_t dns_threat_whitelist_mtime;
+static int dns_threat_whitelist_loaded;
 
 static uint32_t _dns_threat_cache_key(const char *ioc, int is_ip);
 static int _dns_threat_is_expired(unsigned long expired_tick);
+static void _dns_threat_whitelist_load(void);
+static int _dns_threat_is_domain_whitelisted(const char *domain);
 
 static void _dns_threat_cache_init(void)
 {
 	hash_init(dns_threat_cache);
 	INIT_LIST_HEAD(&dns_threat_cache_list);
 	dns_threat_cache_num = 0;
+}
+
+static void _dns_threat_whitelist_clear_unlocked(void)
+{
+	struct dns_threat_whitelist_entry *entry = NULL;
+	struct hlist_node *tmp = NULL;
+	unsigned long bucket = 0;
+
+	hash_for_each_safe(dns_threat_whitelist, bucket, tmp, entry, node)
+	{
+		hash_del(&entry->node);
+		free(entry);
+	}
+	hash_init(dns_threat_whitelist);
+	dns_threat_whitelist_loaded = 0;
+	dns_threat_whitelist_mtime = 0;
+}
+
+static void _dns_threat_trim_line(char *line)
+{
+	char *start = line;
+	char *end = NULL;
+
+	while (*start != '\0' && isspace((unsigned char)*start)) {
+		start++;
+	}
+	if (start != line) {
+		memmove(line, start, strlen(start) + 1);
+	}
+
+	end = line + strlen(line);
+	while (end > line && isspace((unsigned char)*(end - 1))) {
+		end--;
+	}
+	*end = '\0';
+}
+
+static void _dns_threat_whitelist_load(void)
+{
+	const char *path = dns_conf.threat_intelligence_whitelist;
+	struct stat st;
+	FILE *fp = NULL;
+	char line[DNS_MAX_CNAME_LEN * 2];
+
+	pthread_mutex_lock(&dns_threat_whitelist_lock);
+	if (path[0] == '\0') {
+		_dns_threat_whitelist_clear_unlocked();
+		pthread_mutex_unlock(&dns_threat_whitelist_lock);
+		return;
+	}
+
+	if (stat(path, &st) != 0) {
+		_dns_threat_whitelist_clear_unlocked();
+		pthread_mutex_unlock(&dns_threat_whitelist_lock);
+		return;
+	}
+
+	if (dns_threat_whitelist_loaded == 1 && dns_threat_whitelist_mtime == st.st_mtime) {
+		pthread_mutex_unlock(&dns_threat_whitelist_lock);
+		return;
+	}
+
+	_dns_threat_whitelist_clear_unlocked();
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		pthread_mutex_unlock(&dns_threat_whitelist_lock);
+		return;
+	}
+
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		struct dns_threat_whitelist_entry *entry = NULL;
+		uint32_t key = 0;
+
+		_dns_threat_trim_line(line);
+		if (line[0] == '\0' || line[0] == '#') {
+			continue;
+		}
+		if (strlen(line) >= DNS_MAX_CNAME_LEN) {
+			continue;
+		}
+
+		entry = zalloc(1, sizeof(*entry));
+		if (entry == NULL) {
+			continue;
+		}
+
+		safe_strncpy(entry->domain, line, sizeof(entry->domain));
+		key = hash_string(entry->domain);
+		hash_add(dns_threat_whitelist, &entry->node, key);
+	}
+
+	fclose(fp);
+	dns_threat_whitelist_loaded = 1;
+	dns_threat_whitelist_mtime = st.st_mtime;
+	pthread_mutex_unlock(&dns_threat_whitelist_lock);
+}
+
+static int _dns_threat_is_domain_whitelisted(const char *domain)
+{
+	struct dns_threat_whitelist_entry *entry = NULL;
+	uint32_t key = hash_string(domain);
+	int found = 0;
+
+	if (dns_conf.threat_intelligence_whitelist[0] == '\0') {
+		return 0;
+	}
+
+	_dns_threat_whitelist_load();
+	pthread_mutex_lock(&dns_threat_whitelist_lock);
+	hash_for_each_possible(dns_threat_whitelist, entry, node, key)
+	{
+		if (strcasecmp(entry->domain, domain) == 0) {
+			found = 1;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&dns_threat_whitelist_lock);
+
+	return found;
 }
 
 static int _dns_threat_cache_ttl_ms(void)
@@ -757,6 +891,11 @@ dns_threat_query_result _dns_server_threat_check_domain(struct dns_request *requ
 		return DNS_THREAT_QUERY_SAFE;
 	}
 
+	if (_dns_threat_is_domain_whitelisted(domain)) {
+		tlog(TLOG_DEBUG, "threat whitelist hit: %s", domain);
+		return DNS_THREAT_QUERY_SAFE;
+	}
+
 	if (_dns_threat_cache_get(domain, 0, &result) == 0) {
 		return result;
 	}
@@ -787,19 +926,28 @@ int _dns_server_threat_block_request(struct dns_request *request)
 {
 	struct dns_server_post_context context;
 	unsigned char addr[DNS_RR_AAAA_LEN] = {0};
-	int addr_len = DNS_RR_A_LEN;
+	char ip[DNS_MAX_IPLEN] = {0};
+	int port = PORT_NOT_DEFINED;
+	int parse_ok = 0;
 	const char *block_ip = dns_conf.threat_intelligence_block_ipv4;
 
 	if (request->qtype == DNS_T_AAAA) {
 		block_ip = dns_conf.threat_intelligence_block_ipv6;
-		addr_len = DNS_RR_AAAA_LEN;
 	}
 
 	if (block_ip[0] == '\0') {
 		block_ip = request->qtype == DNS_T_AAAA ? "::" : "0.0.0.0";
 	}
 
-	if (parse_ip(block_ip, (char *)addr, &addr_len) != 0) {
+	if (parse_ip(block_ip, ip, &port) == 0) {
+		if (request->qtype == DNS_T_AAAA) {
+			parse_ok = (inet_pton(AF_INET6, ip, addr) == 1);
+		} else {
+			parse_ok = (inet_pton(AF_INET, ip, addr) == 1);
+		}
+	}
+
+	if (parse_ok == 0) {
 		tlog(TLOG_WARN, "parse threat block ip failed, fallback to local null route.");
 		if (request->qtype == DNS_T_AAAA) {
 			memset(addr, 0, DNS_RR_AAAA_LEN);

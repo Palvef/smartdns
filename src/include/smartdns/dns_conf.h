@@ -781,6 +781,7 @@ struct dns_config {
 	int threat_intelligence_cache_ttl;
 	int threat_intelligence_cache_size;
 	char threat_intelligence_cache_file[DNS_MAX_PATH];
+	char threat_intelligence_whitelist[DNS_MAX_PATH];
 };
 extern struct dns_config dns_conf;
 
