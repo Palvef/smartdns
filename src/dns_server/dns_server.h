@@ -400,6 +400,7 @@ struct dns_request {
 
 	uint64_t query_timestamp;
 	int query_time;
+	int is_blackhole;
 };
 
 /* dns server data */
