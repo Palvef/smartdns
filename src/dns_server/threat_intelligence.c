@@ -33,7 +33,7 @@
 #include <string.h>
 
 #define DNS_THREAT_BUF_SIZE (1024 * 1024)
-#define DNS_THREAT_MAX_BATCH 4096
+#define DNS_THREAT_MAX_BATCH 2048
 #define DNS_THREAT_CACHE_TTL_MS_DEFAULT (5 * 60 * 1000)
 #define DNS_THREAT_CACHE_MAX_DEFAULT 65536
 
@@ -653,6 +653,9 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 {
 	(void)request;
 	int is_ip = 1;
+	const char **query_ioc = NULL;
+	int *query_map = NULL;
+	dns_threat_query_result *query_results = NULL;
 
 	if (count <= 0 || count > DNS_THREAT_MAX_BATCH) {
 		return -1;
@@ -673,9 +676,13 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 		}
 	}
 
-	const char *query_ioc[DNS_THREAT_MAX_BATCH];
-	int query_map[DNS_THREAT_MAX_BATCH];
 	int query_num = 0;
+	query_ioc = malloc(sizeof(*query_ioc) * count);
+	query_map = malloc(sizeof(*query_map) * count);
+	if (query_ioc == NULL || query_map == NULL) {
+		goto out;
+	}
+
 	for (int i = 0; i < count; i++) {
 		if (results[i] != DNS_THREAT_QUERY_SAFE || _dns_threat_cache_get(ioc[i], is_ip, &results[i]) == 0) {
 			continue;
@@ -686,8 +693,11 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 	}
 
 	if (query_num > 0) {
-		dns_threat_query_result query_results[DNS_THREAT_MAX_BATCH];
 		int msearch_size = dns_conf.threat_intelligence_msearch_size;
+		query_results = malloc(sizeof(*query_results) * query_num);
+		if (query_results == NULL) {
+			goto out;
+		}
 		if (msearch_size <= 0) {
 			msearch_size = 100;
 		}
@@ -713,6 +723,17 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 			results[query_map[i]] = final_result;
 			_dns_threat_cache_set(query_ioc[i], is_ip, final_result);
 		}
+	}
+
+out:
+	if (query_ioc != NULL) {
+		free(query_ioc);
+	}
+	if (query_map != NULL) {
+		free(query_map);
+	}
+	if (query_results != NULL) {
+		free(query_results);
 	}
 
 	(void)is_ipv6;

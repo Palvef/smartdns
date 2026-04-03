@@ -398,10 +398,10 @@ static void _dns_conf_default_value_init(void)
 	dns_conf.cachesize = -1;
 	dns_conf.cache_max_memsize = -1;
 	dns_conf.threat_intelligence_fail_bypass = 1;
-	dns_conf.threat_intelligence_msearch_size = 100;
+	dns_conf.threat_intelligence_msearch_size = 200;
 	dns_conf.threat_intelligence_cache_enable = 1;
 	dns_conf.threat_intelligence_cache_ttl = 300;
-	dns_conf.threat_intelligence_cache_size = 65536;
+	dns_conf.threat_intelligence_cache_size = 655360;
 	safe_strncpy(dns_conf.threat_intelligence_index, "threat_intelligence_data",
 				 sizeof(dns_conf.threat_intelligence_index));
 	safe_strncpy(dns_conf.threat_intelligence_block_ipv4, "0.0.0.0", sizeof(dns_conf.threat_intelligence_block_ipv4));
