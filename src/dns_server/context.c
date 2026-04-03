@@ -853,6 +853,32 @@ int _dns_request_post(struct dns_server_post_context *context)
 		return -1;
 	}
 
+	if (dns_conf.threat_intelligence_query == 1 &&
+		(context->qtype == DNS_T_A || context->qtype == DNS_T_AAAA)) {
+		for (int i = 0; i < context->ip_num && i < MAX_IP_NUM; i++) {
+			const unsigned char *ip_addr = context->ip_addr[i];
+			char ip[DNS_MAX_CNAME_LEN] = {0};
+
+			if (ip_addr == NULL) {
+				continue;
+			}
+
+			if (context->qtype == DNS_T_A) {
+				snprintf(ip, sizeof(ip), "%d.%d.%d.%d", ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3]);
+			} else {
+				snprintf(ip, sizeof(ip),
+						 "[%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x:%.2x%.2x]", ip_addr[0],
+						 ip_addr[1], ip_addr[2], ip_addr[3], ip_addr[4], ip_addr[5], ip_addr[6], ip_addr[7], ip_addr[8],
+						 ip_addr[9], ip_addr[10], ip_addr[11], ip_addr[12], ip_addr[13], ip_addr[14], ip_addr[15]);
+			}
+
+			_dns_server_request_get(request);
+			if (_dns_server_check_speed(request, ip) != 0) {
+				_dns_server_request_release(request);
+			}
+		}
+	}
+
 	return 0;
 }
 
