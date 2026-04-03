@@ -842,6 +842,11 @@ int _dns_request_post(struct dns_server_post_context *context)
 		 request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT,
 		 get_tick_count() - request->send_tick);
 
+	if (dns_conf.threat_intelligence_query == 1 &&
+		(context->qtype == DNS_T_A || context->qtype == DNS_T_AAAA)) {
+		_dns_server_second_ping_check(request);
+	}
+
 	ret = _dns_reply_inpacket(request, context->inpacket, context->inpacket_len);
 	if (ret != 0) {
 		tlog(TLOG_DEBUG, "reply raw packet to client failed.");
