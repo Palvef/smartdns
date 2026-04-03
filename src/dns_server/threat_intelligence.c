@@ -335,6 +335,9 @@ static void _dns_threat_cache_load_from_file(void)
 		if (sscanf(line, "%d\t%d\t%lu\t%255s", &is_ip, &result, &expired_tick, ioc) != 4) {
 			continue;
 		}
+		if (result != DNS_THREAT_QUERY_MALICIOUS) {
+			continue;
+		}
 
 		if (_dns_threat_is_expired(expired_tick)) {
 			continue;
@@ -391,6 +394,9 @@ static void _dns_threat_cache_save_to_file(void)
 	{
 		entry = list_entry(pos, struct dns_threat_cache_entry, list);
 		if (_dns_threat_is_expired(entry->expired_tick)) {
+			continue;
+		}
+		if (entry->result != DNS_THREAT_QUERY_MALICIOUS) {
 			continue;
 		}
 		fprintf(fp, "%d\t%d\t%lu\t%s\n", entry->is_ip, entry->result, entry->expired_tick, entry->ioc);
@@ -470,6 +476,13 @@ static int _dns_threat_cache_get(const char *ioc, int is_ip, dns_threat_query_re
 	{
 		if (entry->key != key || entry->is_ip != is_ip || strcmp(entry->ioc, ioc) != 0) {
 			continue;
+		}
+		if (entry->result != DNS_THREAT_QUERY_MALICIOUS) {
+			hash_del(&entry->node);
+			list_del(&entry->list);
+			free(entry);
+			dns_threat_cache_num--;
+			break;
 		}
 
 		if (_dns_threat_is_expired(entry->expired_tick)) {
