@@ -106,9 +106,11 @@ static int _dns_server_process_answer_A_IP(struct dns_request *request, char *cn
 		snprintf(ip, sizeof(ip), "%d.%d.%d.%d", paddr[0], paddr[1], paddr[2], paddr[3]);
 
 		/* start ping */
-		_dns_server_request_get(request);
-		if (_dns_server_check_speed(request, ip) != 0) {
-			_dns_server_request_release(request);
+		if (dns_conf.threat_intelligence_query == 0) {
+			_dns_server_request_get(request);
+			if (_dns_server_check_speed(request, ip) != 0) {
+				_dns_server_request_release(request);
+			}
 		}
 	}
 
@@ -197,9 +199,11 @@ static int _dns_server_process_answer_AAAA_IP(struct dns_request *request, char 
 				 paddr[11], paddr[12], paddr[13], paddr[14], paddr[15]);
 
 		/* start ping */
-		_dns_server_request_get(request);
-		if (_dns_server_check_speed(request, ip) != 0) {
-			_dns_server_request_release(request);
+		if (dns_conf.threat_intelligence_query == 0) {
+			_dns_server_request_get(request);
+			if (_dns_server_check_speed(request, ip) != 0) {
+				_dns_server_request_release(request);
+			}
 		}
 	}
 
