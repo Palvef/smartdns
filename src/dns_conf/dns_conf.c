@@ -54,6 +54,7 @@
 #include "smartdns_domain.h"
 #include "speed_check_mode.h"
 #include "srv_record.h"
+#include "threat_intelligence.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -206,6 +207,15 @@ static struct config_item _config_item[] = {
 	CONF_INT("audit-num", &dns_conf.audit_num, 0, 1024),
 	CONF_YESNO("audit-console", &dns_conf.audit_console),
 	CONF_YESNO("audit-syslog", &dns_conf.audit_syslog),
+	CONF_YESNO("threat-intelligence-query", &dns_conf.threat_intelligence_query),
+	CONF_CUSTOM("threat-intelligence", _config_threat_intelligence, NULL),
+	CONF_YESNO("threat-intelligence-query-fail-bypass", &dns_conf.threat_intelligence_fail_bypass),
+	CONF_INT("threat-intelligence-msearch-size", &dns_conf.threat_intelligence_msearch_size, 1, 2048),
+	CONF_YESNO("threat-intelligence-cache-enable", &dns_conf.threat_intelligence_cache_enable),
+	CONF_INT("threat-intelligence-cache-ttl", &dns_conf.threat_intelligence_cache_ttl, 1, 3600 * 24 * 30),
+	CONF_INT("threat-intelligence-cache-size", &dns_conf.threat_intelligence_cache_size, 1, 10000000),
+	CONF_CUSTOM("threat-intelligence-cache-file", _config_option_parser_filepath,
+				(char *)&dns_conf.threat_intelligence_cache_file),
 	CONF_YESNO("acl-enable", &dns_conf.acl_enable),
 	CONF_INT_FUNC("rr-ttl", _dns_conf_group_int, group_member(dns_rr_ttl), 0, CONF_INT_MAX),
 	CONF_INT_FUNC("rr-ttl-min", _dns_conf_group_int, group_member(dns_rr_ttl_min), 0, CONF_INT_MAX),
@@ -387,6 +397,15 @@ static void _dns_conf_default_value_init(void)
 	dns_conf.resolv_hostname = 1;
 	dns_conf.cachesize = -1;
 	dns_conf.cache_max_memsize = -1;
+	dns_conf.threat_intelligence_fail_bypass = 1;
+	dns_conf.threat_intelligence_msearch_size = 200;
+	dns_conf.threat_intelligence_cache_enable = 1;
+	dns_conf.threat_intelligence_cache_ttl = 300;
+	dns_conf.threat_intelligence_cache_size = 655360;
+	safe_strncpy(dns_conf.threat_intelligence_index, "threat_intelligence_data",
+				 sizeof(dns_conf.threat_intelligence_index));
+	safe_strncpy(dns_conf.threat_intelligence_block_ipv4, "0.0.0.0", sizeof(dns_conf.threat_intelligence_block_ipv4));
+	safe_strncpy(dns_conf.threat_intelligence_block_ipv6, "::", sizeof(dns_conf.threat_intelligence_block_ipv6));
 
 	dns_conf.default_check_orders.orders[0].type = DOMAIN_CHECK_ICMP;
 	dns_conf.default_check_orders.orders[0].tcp_port = 0;
