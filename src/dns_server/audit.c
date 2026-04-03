@@ -197,10 +197,12 @@ void _dns_server_audit_log(struct dns_server_post_context *context)
 		req_result[0] = '\0';
 	}
 
-	tlog_printf(dns_audit, "%s%s query %s, type %d, time %dms, speed: %.1fms, group %s, result %s, rcode %s\n", req_time,
+	tlog_printf(dns_audit,
+				"%s%s query %s, type %d, time %dms, speed: %.1fms, group %s, result %s, rcode %s, is_blackhole %s\n",
+				req_time,
 				req_host, request->domain, request->qtype, request->query_time, ((float)request->ping_time) / 10,
 				request->dns_group_name[0] != '\0' ? request->dns_group_name : DNS_SERVER_GROUP_DEFAULT, req_result,
-				rcode_str != NULL ? rcode_str : "UNKNOWN");
+				rcode_str != NULL ? rcode_str : "UNKNOWN", request->is_blackhole ? "true" : "false");
 }
 
 static int _dns_server_audit_syslog(struct tlog_log *log, const char *buff, int bufflen)
