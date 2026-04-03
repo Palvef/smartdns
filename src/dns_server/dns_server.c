@@ -46,6 +46,7 @@
 #include "server_http2.h"
 #include "soa.h"
 #include "speed_check.h"
+#include "threat_intelligence.h"
 
 #include "smartdns/dns_cache.h"
 #include "smartdns/dns_client.h"
@@ -242,6 +243,7 @@ int dns_server_get_server_name(char *name, int name_len)
 int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 {
 	int ret = -1;
+	dns_threat_query_result threat_result = DNS_THREAT_QUERY_SAFE;
 	const char *server_group_name = NULL;
 	struct dns_query_options options;
 	char *request_domain = request->domain;
@@ -274,6 +276,13 @@ int _dns_server_do_query(struct dns_request *request, int skip_notify_event)
 	_dns_server_set_dualstack_selection(request);
 
 	if (_dns_server_process_special_query(request) == 0) {
+		goto clean_exit;
+	}
+
+	threat_result = _dns_server_threat_check_domain(request);
+	if (threat_result == DNS_THREAT_QUERY_MALICIOUS) {
+		tlog(TLOG_INFO, "domain %s matched threat intelligence, return blackhole address", request->domain);
+		_dns_server_threat_block_request(request);
 		goto clean_exit;
 	}
 
