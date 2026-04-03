@@ -294,12 +294,13 @@ static int _dns_threat_cache_get(const char *ioc, int is_ip, dns_threat_query_re
 			break;
 		}
 
-		*result = entry->result;
-		list_del(&entry->list);
-		list_add_tail(&entry->list, &dns_threat_cache_list);
-		pthread_mutex_unlock(&dns_threat_cache_lock);
-		return 0;
-	}
+			*result = entry->result;
+			list_del(&entry->list);
+			list_add_tail(&entry->list, &dns_threat_cache_list);
+			pthread_mutex_unlock(&dns_threat_cache_lock);
+			tlog(TLOG_DEBUG, "threat cache hit: %s type=%s result=%d", ioc, is_ip ? "ip" : "domain", *result);
+			return 0;
+		}
 	pthread_mutex_unlock(&dns_threat_cache_lock);
 
 	return -1;
@@ -550,6 +551,7 @@ static int _dns_threat_query_batch_from_es(const char **ioc, int count, int is_i
 	int ret = -1;
 	const char *responses = NULL;
 	const char *next = NULL;
+	unsigned long start_tick = get_tick_count();
 
 	pthread_once(&dns_threat_curl_once, _dns_threat_curl_global_init);
 	payload = _dns_threat_build_msearch_payload(ioc, count);
@@ -593,8 +595,10 @@ static int _dns_threat_query_batch_from_es(const char **ioc, int count, int is_i
 
 	code = curl_easy_perform(curl);
 	if (code != CURLE_OK || resp.data == NULL || resp.len == 0) {
+		tlog(TLOG_WARN, "threat msearch query failed, code=%d", (int)code);
 		goto out;
 	}
+	tlog(TLOG_DEBUG, "threat msearch query done, ioc_count=%d, cost=%lums", count, get_tick_count() - start_tick);
 
 	responses = strstr(resp.data, "\"responses\":");
 	if (responses == NULL) {
@@ -612,10 +616,14 @@ static int _dns_threat_query_batch_from_es(const char **ioc, int count, int is_i
 			goto out;
 		}
 
-		char one[32768];
+		char *one = malloc(len + 1);
+		if (one == NULL) {
+			goto out;
+		}
 		memcpy(one, next - len, len);
 		one[len] = '\0';
 		result[i] = _dns_threat_parse_single_response(one, is_ip);
+		free(one);
 	}
 
 	ret = 0;
@@ -758,6 +766,7 @@ dns_threat_query_result _dns_server_threat_check_domain(struct dns_request *requ
 	}
 
 	result = _dns_server_threat_query_eval(result);
+	tlog(TLOG_DEBUG, "threat domain result: %s result=%d", domain, result);
 	_dns_threat_cache_set(domain, 0, result);
 	return result;
 }
