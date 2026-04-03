@@ -22,6 +22,7 @@
 #include "ptr.h"
 
 #include "smartdns/dns_conf.h"
+#include "smartdns/lib/stringutil.h"
 #include "smartdns/tlog.h"
 #include "smartdns/util.h"
 
@@ -167,7 +168,7 @@ static void _dns_threat_whitelist_load(void)
 			continue;
 		}
 
-		safe_strncpy(entry->domain, line, sizeof(entry->domain));
+		safe_strncpy_lower(entry->domain, line, sizeof(entry->domain), NULL);
 		key = hash_string(entry->domain);
 		hash_add(dns_threat_whitelist, &entry->node, key);
 	}
@@ -885,28 +886,31 @@ out:
 dns_threat_query_result _dns_server_threat_check_domain(struct dns_request *request)
 {
 	dns_threat_query_result result = DNS_THREAT_QUERY_SAFE;
-	const char *domain = request->domain;
+	char domain[DNS_MAX_CNAME_LEN] = {0};
+	const char *query_domain = domain;
 
 	if (_dns_threat_intelligence_enabled() == 0) {
 		return DNS_THREAT_QUERY_SAFE;
 	}
 
-	if (_dns_threat_is_domain_whitelisted(domain)) {
-		tlog(TLOG_DEBUG, "threat whitelist hit: %s", domain);
-		return DNS_THREAT_QUERY_SAFE;
-	}
-
-	if (_dns_threat_cache_get(domain, 0, &result) == 0) {
+	safe_strncpy_lower(domain, request->domain, sizeof(domain), NULL);
+	if (_dns_threat_cache_get(query_domain, 0, &result) == 0) {
 		return result;
 	}
 
-	if (_dns_threat_query_batch_from_es(&domain, 1, 0, &result) != 0) {
+	if (_dns_threat_is_domain_whitelisted(query_domain)) {
+		tlog(TLOG_DEBUG, "threat whitelist hit: %s", query_domain);
+		_dns_threat_cache_set(query_domain, 0, DNS_THREAT_QUERY_SAFE);
+		return DNS_THREAT_QUERY_SAFE;
+	}
+
+	if (_dns_threat_query_batch_from_es(&query_domain, 1, 0, &result) != 0) {
 		result = DNS_THREAT_QUERY_ERROR;
 	}
 
 	result = _dns_server_threat_query_eval(result);
-	tlog(TLOG_DEBUG, "threat domain result: %s result=%d", domain, result);
-	_dns_threat_cache_set(domain, 0, result);
+	tlog(TLOG_DEBUG, "threat domain result: %s result=%d", query_domain, result);
+	_dns_threat_cache_set(query_domain, 0, result);
 	return result;
 }
 
