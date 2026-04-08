@@ -90,6 +90,8 @@ static void _dns_threat_cache_init(void)
 	hash_init(dns_threat_cache);
 	INIT_LIST_HEAD(&dns_threat_cache_list);
 	dns_threat_cache_num = 0;
+	dns_threat_cache_last_save = get_tick_count();
+	dns_threat_cache_append_since_save = 0;
 	/* Register atexit handler to save cache when program exits */
 	pthread_once(&dns_threat_cache_file_once, _dns_threat_cache_file_init);
 }
@@ -455,14 +457,22 @@ static void _dns_threat_cache_save_to_file(void)
 static void _dns_threat_cache_maybe_compact_file(int force)
 {
 	unsigned long now = get_tick_count();
+	unsigned long last_save = 0;
+	int append_since_save = 0;
 
 	if (dns_conf.threat_intelligence_cache_enable == 0) {
 		return;
 	}
 
+	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
+	pthread_mutex_lock(&dns_threat_cache_file_lock);
+	last_save = dns_threat_cache_last_save;
+	append_since_save = dns_threat_cache_append_since_save;
+	pthread_mutex_unlock(&dns_threat_cache_file_lock);
+
 	if (force ||
-		dns_threat_cache_append_since_save >= DNS_THREAT_CACHE_COMPACT_APPEND_THRESHOLD ||
-		(now - dns_threat_cache_last_save) >= DNS_THREAT_CACHE_COMPACT_INTERVAL_MS) {
+		append_since_save >= DNS_THREAT_CACHE_COMPACT_APPEND_THRESHOLD ||
+		(now - last_save) >= DNS_THREAT_CACHE_COMPACT_INTERVAL_MS) {
 		_dns_threat_cache_save_to_file();
 	}
 }
