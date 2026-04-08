@@ -79,7 +79,6 @@ static void _dns_threat_whitelist_load(void);
 static int _dns_threat_is_domain_whitelisted(const char *domain);
 static void _dns_threat_cache_file_init(void);
 static void _dns_threat_cache_save_atexit(void);
-static void _dns_threat_cache_append_to_file(const char *ioc, int is_ip, dns_threat_query_result result, time_t expired_time);
 
 static void _dns_threat_cache_init(void)
 {
@@ -244,34 +243,6 @@ static void _dns_threat_cache_save_to_file(void);
 static void _dns_threat_cache_save_atexit(void)
 {
 	_dns_threat_cache_save_to_file();
-}
-
-static void _dns_threat_cache_append_to_file(const char *ioc, int is_ip, dns_threat_query_result result, time_t expired_time)
-{
-	FILE *fp = NULL;
-
-	if (dns_conf.threat_intelligence_cache_enable == 0) {
-		return;
-	}
-
-	if (result == DNS_THREAT_QUERY_ERROR) {
-		return;
-	}
-
-	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
-	pthread_mutex_lock(&dns_threat_cache_file_lock);
-	fp = fopen(_dns_threat_cache_file(), "a");
-	if (fp == NULL) {
-		pthread_mutex_unlock(&dns_threat_cache_file_lock);
-		return;
-	}
-
-	if (fprintf(fp, "%d\t%d\t%lu\t%s\n", is_ip, result, (unsigned long)expired_time, ioc) >= 0) {
-		fflush(fp);
-		fsync(fileno(fp));
-	}
-	fclose(fp);
-	pthread_mutex_unlock(&dns_threat_cache_file_lock);
 }
 
 static void _dns_threat_cache_load_from_file(void)
@@ -570,7 +541,7 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 		list_del(&entry->list);
 		list_add_tail(&entry->list, &dns_threat_cache_list);
 		pthread_mutex_unlock(&dns_threat_cache_lock);
-		_dns_threat_cache_append_to_file(ioc, is_ip, result, expired_time);
+		_dns_threat_cache_save_to_file();
 		return;
 	}
 
@@ -599,8 +570,8 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 	}
 	pthread_mutex_unlock(&dns_threat_cache_lock);
 
-	/* Append one record each update; avoid rewriting huge cache files on every query. */
-	_dns_threat_cache_append_to_file(ioc, is_ip, result, expired_time);
+	/* Rewrite cache file from in-memory index to keep entries unique. */
+	_dns_threat_cache_save_to_file();
 }
 
 static int _dns_threat_is_whitelist(const char *response)
