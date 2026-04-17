@@ -61,7 +61,11 @@ struct dns_threat_whitelist_entry {
 	char domain[DNS_MAX_CNAME_LEN];
 };
 
-static pthread_mutex_t dns_threat_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+/* rwlock rather than mutex: the cache_get hit path is a pure read after the
+   expired-cleanup was moved to cache_set's refresh path, so many concurrent
+   DNS workers can look up in parallel. Writers (cache_set, compact, load)
+   still need exclusive access. */
+static pthread_rwlock_t dns_threat_cache_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 /* 2^18 = 256K buckets. Sized so lookups remain near-O(1) for multi-million
    entry caches (e.g. 1.5M entries -> ~6 per bucket). 2MB static overhead. */
 static DECLARE_HASHTABLE(dns_threat_cache, 18);
@@ -334,7 +338,7 @@ static void _dns_threat_cache_load_from_file(void)
 		return;
 	}
 
-	pthread_mutex_lock(&dns_threat_cache_lock);
+	pthread_rwlock_wrlock(&dns_threat_cache_rwlock);
 	while (fgets(line, sizeof(line), fp) != NULL) {
 		struct dns_threat_cache_entry *entry = NULL;
 		struct dns_threat_cache_entry *exist = NULL;
@@ -398,7 +402,7 @@ static void _dns_threat_cache_load_from_file(void)
 			dns_threat_cache_num--;
 		}
 	}
-	pthread_mutex_unlock(&dns_threat_cache_lock);
+	pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 	fclose(fp);
 
 	dns_threat_cache_loaded = 1;
@@ -444,11 +448,11 @@ static void _dns_threat_cache_save_to_file(int force)
 	/* Serialize the cache to an in-memory buffer while holding cache_lock.
 	   Disk I/O is then done after releasing cache_lock so concurrent cache
 	   reads/writes aren't blocked on file writes. */
-	pthread_mutex_lock(&dns_threat_cache_lock);
+	pthread_rwlock_rdlock(&dns_threat_cache_rwlock);
 	buf_cap = (size_t)dns_threat_cache_num * 64 + 4096;
 	buf = malloc(buf_cap);
 	if (buf == NULL) {
-		pthread_mutex_unlock(&dns_threat_cache_lock);
+		pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 		/* Mark as attempted so sustained memory pressure doesn't cause every
 		   cache_set to retry the malloc; data is still in the append log. */
 		dns_threat_cache_last_save = get_tick_count();
@@ -498,7 +502,7 @@ static void _dns_threat_cache_save_to_file(int force)
 		buf_len += (size_t)len;
 		entry_count++;
 	}
-	pthread_mutex_unlock(&dns_threat_cache_lock);
+	pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 
 	if (!save_failed && entry_count > 0) {
 		snprintf(tmp_file, sizeof(tmp_file), "%s.tmp", _dns_threat_cache_file());
@@ -621,9 +625,11 @@ static int _dns_threat_is_expired(time_t expired_time)
 	return 0;
 }
 
-/* Caller must hold dns_threat_cache_lock. Does NOT perform LRU move on hit —
-   list order is insertion-order (FIFO) for eviction. This keeps the hit path
-   a pure read, avoiding cache-line bouncing on the LRU list head under load. */
+/* Caller must hold dns_threat_cache_rwlock (read OR write). Pure reader: no
+   LRU move, no expired-entry deletion. Expired entries are treated as a miss
+   and left in place; they're refreshed in-place by the follow-up cache_set,
+   or eventually evicted when cache_size is exceeded (FIFO). Keeping this
+   function read-only lets many DNS workers run lookups concurrently. */
 static int _dns_threat_cache_get_locked(const char *ioc, int is_ip, time_t now_sec,
 										 dns_threat_query_result *result)
 {
@@ -637,10 +643,6 @@ static int _dns_threat_cache_get_locked(const char *ioc, int is_ip, time_t now_s
 		}
 
 		if (entry->expired_time == 0 || entry->expired_time < now_sec) {
-			hash_del(&entry->node);
-			list_del(&entry->list);
-			free(entry);
-			dns_threat_cache_num--;
 			return -1;
 		}
 
@@ -659,9 +661,9 @@ static int _dns_threat_cache_get(const char *ioc, int is_ip, dns_threat_query_re
 	if (!dns_threat_cache_loaded) {
 		_dns_threat_cache_load_from_file();
 	}
-	pthread_mutex_lock(&dns_threat_cache_lock);
+	pthread_rwlock_rdlock(&dns_threat_cache_rwlock);
 	ret = _dns_threat_cache_get_locked(ioc, is_ip, time(NULL), result);
-	pthread_mutex_unlock(&dns_threat_cache_lock);
+	pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 
 	return ret;
 }
@@ -684,7 +686,7 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 	if (!dns_threat_cache_loaded) {
 		_dns_threat_cache_load_from_file();
 	}
-	pthread_mutex_lock(&dns_threat_cache_lock);
+	pthread_rwlock_wrlock(&dns_threat_cache_rwlock);
 	hash_for_each_possible(dns_threat_cache, entry, node, key)
 	{
 		if (entry->key != key || entry->is_ip != is_ip || strcmp(entry->ioc, ioc) != 0) {
@@ -695,7 +697,7 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 		entry->expired_time = expired_time;
 		list_del(&entry->list);
 		list_add_tail(&entry->list, &dns_threat_cache_list);
-		pthread_mutex_unlock(&dns_threat_cache_lock);
+		pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 		/* Persist updated IOC immediately to avoid losing fresher result/TTL on restart. */
 		_dns_threat_cache_append_to_file(ioc, is_ip, result, expired_time);
 		_dns_threat_cache_maybe_compact_file();
@@ -704,7 +706,7 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 
 	entry = zalloc(1, sizeof(*entry));
 	if (entry == NULL) {
-		pthread_mutex_unlock(&dns_threat_cache_lock);
+		pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 		return;
 	}
 
@@ -725,7 +727,7 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 		free(oldest);
 		dns_threat_cache_num--;
 	}
-	pthread_mutex_unlock(&dns_threat_cache_lock);
+	pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 
 	/* New IOC append keeps miss path O(1); periodic compaction deduplicates file. */
 	_dns_threat_cache_append_to_file(ioc, is_ip, result, expired_time);
@@ -1067,14 +1069,14 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 		}
 	}
 
-	/* Batch all cache lookups under a single lock acquisition to cut mutex
-	   contention on dns_threat_cache_lock from N ops/response to 1 op/response. */
+	/* Batch all cache lookups under a single rwlock rdlock acquisition so N
+	   concurrent worker threads can look up in parallel without serializing. */
 	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
 	if (!dns_threat_cache_loaded) {
 		_dns_threat_cache_load_from_file();
 	}
 	time_t now_sec = time(NULL);
-	pthread_mutex_lock(&dns_threat_cache_lock);
+	pthread_rwlock_rdlock(&dns_threat_cache_rwlock);
 	for (int i = 0; i < count; i++) {
 		dns_threat_query_result cached = DNS_THREAT_QUERY_SAFE;
 		if (_dns_threat_cache_get_locked(ioc[i], is_ip, now_sec, &cached) == 0) {
@@ -1085,7 +1087,7 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 			query_num++;
 		}
 	}
-	pthread_mutex_unlock(&dns_threat_cache_lock);
+	pthread_rwlock_unlock(&dns_threat_cache_rwlock);
 
 	if (query_num > 0) {
 		int msearch_size = dns_conf.threat_intelligence_msearch_size;
