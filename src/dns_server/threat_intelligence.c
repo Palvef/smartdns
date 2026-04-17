@@ -621,41 +621,49 @@ static int _dns_threat_is_expired(time_t expired_time)
 	return 0;
 }
 
-static int _dns_threat_cache_get(const char *ioc, int is_ip, dns_threat_query_result *result)
+/* Caller must hold dns_threat_cache_lock. Does NOT perform LRU move on hit —
+   list order is insertion-order (FIFO) for eviction. This keeps the hit path
+   a pure read, avoiding cache-line bouncing on the LRU list head under load. */
+static int _dns_threat_cache_get_locked(const char *ioc, int is_ip, time_t now_sec,
+										 dns_threat_query_result *result)
 {
 	uint32_t key = _dns_threat_cache_key(ioc, is_ip);
 	struct dns_threat_cache_entry *entry = NULL;
 
-	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
-	/* Load cache file only once, not every query */
-	if (!dns_threat_cache_loaded) {
-		_dns_threat_cache_load_from_file();
-	}
-	pthread_mutex_lock(&dns_threat_cache_lock);
 	hash_for_each_possible(dns_threat_cache, entry, node, key)
 	{
 		if (entry->key != key || entry->is_ip != is_ip || strcmp(entry->ioc, ioc) != 0) {
 			continue;
 		}
 
-		if (_dns_threat_is_expired(entry->expired_time)) {
+		if (entry->expired_time == 0 || entry->expired_time < now_sec) {
 			hash_del(&entry->node);
 			list_del(&entry->list);
 			free(entry);
 			dns_threat_cache_num--;
-			break;
+			return -1;
 		}
 
 		*result = entry->result;
-		list_del(&entry->list);
-		list_add_tail(&entry->list, &dns_threat_cache_list);
-		pthread_mutex_unlock(&dns_threat_cache_lock);
-		tlog(TLOG_DEBUG, "threat cache hit: %s type=%s result=%d cache_size=%d", ioc, is_ip ? "ip" : "domain", *result, dns_threat_cache_num);
 		return 0;
 	}
-	pthread_mutex_unlock(&dns_threat_cache_lock);
 
 	return -1;
+}
+
+static int _dns_threat_cache_get(const char *ioc, int is_ip, dns_threat_query_result *result)
+{
+	int ret = -1;
+
+	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
+	if (!dns_threat_cache_loaded) {
+		_dns_threat_cache_load_from_file();
+	}
+	pthread_mutex_lock(&dns_threat_cache_lock);
+	ret = _dns_threat_cache_get_locked(ioc, is_ip, time(NULL), result);
+	pthread_mutex_unlock(&dns_threat_cache_lock);
+
+	return ret;
 }
 
 static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_result result)
@@ -1030,6 +1038,10 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 	const char **query_ioc = NULL;
 	int *query_map = NULL;
 	dns_threat_query_result *query_results = NULL;
+	/* Stack-alloc for the typical DNS response size (<= 32 IPs) to avoid malloc
+	   on the hot path; fall back to heap for larger batches. */
+	const char *query_ioc_stack[32];
+	int query_map_stack[32];
 
 	if (count <= 0 || count > DNS_THREAT_MAX_BATCH) {
 		return -1;
@@ -1043,25 +1055,37 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 		return 0;
 	}
 
-	/* First pass: check cache for all IPs (cache has SAFE and MALICIOUS entries). */
 	int query_num = 0;
-	query_ioc = malloc(sizeof(*query_ioc) * count);
-	query_map = malloc(sizeof(*query_map) * count);
-	if (query_ioc == NULL || query_map == NULL) {
-		goto out;
+	if (count <= (int)(sizeof(query_ioc_stack) / sizeof(query_ioc_stack[0]))) {
+		query_ioc = query_ioc_stack;
+		query_map = query_map_stack;
+	} else {
+		query_ioc = malloc(sizeof(*query_ioc) * count);
+		query_map = malloc(sizeof(*query_map) * count);
+		if (query_ioc == NULL || query_map == NULL) {
+			goto out;
+		}
 	}
 
+	/* Batch all cache lookups under a single lock acquisition to cut mutex
+	   contention on dns_threat_cache_lock from N ops/response to 1 op/response. */
+	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
+	if (!dns_threat_cache_loaded) {
+		_dns_threat_cache_load_from_file();
+	}
+	time_t now_sec = time(NULL);
+	pthread_mutex_lock(&dns_threat_cache_lock);
 	for (int i = 0; i < count; i++) {
 		dns_threat_query_result cached = DNS_THREAT_QUERY_SAFE;
-		if (_dns_threat_cache_get(ioc[i], is_ip, &cached) == 0) {
+		if (_dns_threat_cache_get_locked(ioc[i], is_ip, now_sec, &cached) == 0) {
 			results[i] = cached;
 		} else {
-			/* Not in cache - need to query */
 			query_ioc[query_num] = ioc[i];
 			query_map[query_num] = i;
 			query_num++;
 		}
 	}
+	pthread_mutex_unlock(&dns_threat_cache_lock);
 
 	if (query_num > 0) {
 		int msearch_size = dns_conf.threat_intelligence_msearch_size;
@@ -1097,10 +1121,10 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 	}
 
 out:
-	if (query_ioc != NULL) {
+	if (query_ioc != NULL && query_ioc != query_ioc_stack) {
 		free(query_ioc);
 	}
-	if (query_map != NULL) {
+	if (query_map != NULL && query_map != query_map_stack) {
 		free(query_map);
 	}
 	if (query_results != NULL) {
