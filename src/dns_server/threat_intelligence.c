@@ -36,11 +36,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define DNS_THREAT_BUF_SIZE (1024 * 1024)
 #define DNS_THREAT_MAX_BATCH 2048
 #define DNS_THREAT_CACHE_TTL_MS_DEFAULT (5 * 60 * 1000)
 #define DNS_THREAT_CACHE_MAX_DEFAULT 65536
+#define DNS_THREAT_CACHE_COMPACT_INTERVAL_MS (5 * 60 * 1000)
+#define DNS_THREAT_CACHE_COMPACT_APPEND_MIN 256
+#define DNS_THREAT_CACHE_COMPACT_APPEND_DIVISOR 4
 
 struct dns_threat_cache_entry {
 	struct hlist_node node;
@@ -58,7 +62,9 @@ struct dns_threat_whitelist_entry {
 };
 
 static pthread_mutex_t dns_threat_cache_lock = PTHREAD_MUTEX_INITIALIZER;
-static DECLARE_HASHTABLE(dns_threat_cache, 10);
+/* 2^18 = 256K buckets. Sized so lookups remain near-O(1) for multi-million
+   entry caches (e.g. 1.5M entries -> ~6 per bucket). 2MB static overhead. */
+static DECLARE_HASHTABLE(dns_threat_cache, 18);
 static struct list_head dns_threat_cache_list;
 static int dns_threat_cache_num;
 static pthread_once_t dns_threat_cache_once = PTHREAD_ONCE_INIT;
@@ -67,6 +73,11 @@ static pthread_once_t dns_threat_cache_file_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t dns_threat_cache_file_lock = PTHREAD_MUTEX_INITIALIZER;
 static int dns_threat_cache_loaded;
 static unsigned long dns_threat_cache_last_save;
+static int dns_threat_cache_append_since_save;
+/* Persistent append handle; reused across misses to avoid per-insert fopen/fclose.
+   Protected by dns_threat_cache_file_lock. Closed before rename in compaction so
+   later appends reopen to the replacement inode. */
+static FILE *dns_threat_cache_append_fp;
 static pthread_mutex_t dns_threat_whitelist_lock = PTHREAD_MUTEX_INITIALIZER;
 static DECLARE_HASHTABLE(dns_threat_whitelist, 10);
 static time_t dns_threat_whitelist_mtime;
@@ -78,12 +89,17 @@ static void _dns_threat_whitelist_load(void);
 static int _dns_threat_is_domain_whitelisted(const char *domain);
 static void _dns_threat_cache_file_init(void);
 static void _dns_threat_cache_save_atexit(void);
+static void _dns_threat_cache_append_to_file(const char *ioc, int is_ip, dns_threat_query_result result, time_t expired_time);
+static void _dns_threat_cache_maybe_compact_file(void);
+static void _dns_threat_cache_save_to_file(int force);
 
 static void _dns_threat_cache_init(void)
 {
 	hash_init(dns_threat_cache);
 	INIT_LIST_HEAD(&dns_threat_cache_list);
 	dns_threat_cache_num = 0;
+	dns_threat_cache_last_save = get_tick_count();
+	dns_threat_cache_append_since_save = 0;
 	/* Register atexit handler to save cache when program exits */
 	pthread_once(&dns_threat_cache_file_once, _dns_threat_cache_file_init);
 }
@@ -237,11 +253,59 @@ static const char *_dns_threat_cache_file(void)
 	return cache_file;
 }
 
-static void _dns_threat_cache_save_to_file(void);
+static int _dns_threat_cache_compact_threshold(void)
+{
+	/* Scale the append threshold with cache size so full-cache rewrite cost stays
+	   amortized: at most 1/DIVISOR of the cache can accumulate in the append log
+	   before compaction. Racy read of dns_threat_cache_num is acceptable — this
+	   is a scheduling heuristic, not a correctness check. */
+	int num = dns_threat_cache_num;
+	int scaled = num / DNS_THREAT_CACHE_COMPACT_APPEND_DIVISOR;
+	return scaled < DNS_THREAT_CACHE_COMPACT_APPEND_MIN ? DNS_THREAT_CACHE_COMPACT_APPEND_MIN : scaled;
+}
 
 static void _dns_threat_cache_save_atexit(void)
 {
-	_dns_threat_cache_save_to_file();
+	_dns_threat_cache_save_to_file(1);
+}
+
+static void _dns_threat_cache_append_fp_close_locked(void)
+{
+	if (dns_threat_cache_append_fp != NULL) {
+		fclose(dns_threat_cache_append_fp);
+		dns_threat_cache_append_fp = NULL;
+	}
+}
+
+static void _dns_threat_cache_append_to_file(const char *ioc, int is_ip, dns_threat_query_result result, time_t expired_time)
+{
+	if (dns_conf.threat_intelligence_cache_enable == 0) {
+		return;
+	}
+
+	if (result == DNS_THREAT_QUERY_ERROR) {
+		return;
+	}
+
+	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
+	pthread_mutex_lock(&dns_threat_cache_file_lock);
+	if (dns_threat_cache_append_fp == NULL) {
+		dns_threat_cache_append_fp = fopen(_dns_threat_cache_file(), "a");
+	}
+	if (dns_threat_cache_append_fp == NULL) {
+		pthread_mutex_unlock(&dns_threat_cache_file_lock);
+		return;
+	}
+
+	if (fprintf(dns_threat_cache_append_fp, "%d\t%d\t%lu\t%s\n", is_ip, result,
+				(unsigned long)expired_time, ioc) >= 0) {
+		/* No fsync and no fclose on the hot path: stdio block-buffers ~4KB worth
+		   of entries; compaction/atexit flushes them. Per-append fsync serialized
+		   every miss on disk latency and was the primary cause of long-running
+		   throughput regression. */
+		dns_threat_cache_append_since_save++;
+	}
+	pthread_mutex_unlock(&dns_threat_cache_file_lock);
 }
 
 static void _dns_threat_cache_load_from_file(void)
@@ -273,6 +337,7 @@ static void _dns_threat_cache_load_from_file(void)
 	pthread_mutex_lock(&dns_threat_cache_lock);
 	while (fgets(line, sizeof(line), fp) != NULL) {
 		struct dns_threat_cache_entry *entry = NULL;
+		struct dns_threat_cache_entry *exist = NULL;
 		int is_ip = 0;
 		int result = DNS_THREAT_QUERY_SAFE;
 		unsigned long expired_tick = 0;
@@ -299,14 +364,39 @@ static void _dns_threat_cache_load_from_file(void)
 		}
 
 		key = _dns_threat_cache_key(ioc, is_ip);
-		entry->key = key;
-		entry->is_ip = is_ip;
-		entry->result = result;
-		entry->expired_time = (time_t)expired_tick;
-		safe_strncpy(entry->ioc, ioc, sizeof(entry->ioc));
-		hash_add(dns_threat_cache, &entry->node, key);
-		list_add_tail(&entry->list, &dns_threat_cache_list);
-		dns_threat_cache_num++;
+		hash_for_each_possible(dns_threat_cache, exist, node, key)
+		{
+			if (exist->key != key || exist->is_ip != is_ip || strcmp(exist->ioc, ioc) != 0) {
+				continue;
+			}
+			exist->result = result;
+			exist->expired_time = (time_t)expired_tick;
+			list_del(&exist->list);
+			list_add_tail(&exist->list, &dns_threat_cache_list);
+			free(entry);
+			entry = NULL;
+			break;
+		}
+
+		if (entry != NULL) {
+			entry->key = key;
+			entry->is_ip = is_ip;
+			entry->result = result;
+			entry->expired_time = (time_t)expired_tick;
+			safe_strncpy(entry->ioc, ioc, sizeof(entry->ioc));
+			hash_add(dns_threat_cache, &entry->node, key);
+			list_add_tail(&entry->list, &dns_threat_cache_list);
+			dns_threat_cache_num++;
+		}
+
+		while (dns_threat_cache_num > _dns_threat_cache_max() && !list_empty(&dns_threat_cache_list)) {
+			struct dns_threat_cache_entry *oldest = NULL;
+			oldest = list_first_entry(&dns_threat_cache_list, struct dns_threat_cache_entry, list);
+			hash_del(&oldest->node);
+			list_del(&oldest->list);
+			free(oldest);
+			dns_threat_cache_num--;
+		}
 	}
 	pthread_mutex_unlock(&dns_threat_cache_lock);
 	fclose(fp);
@@ -321,13 +411,17 @@ static void _dns_threat_cache_file_init(void)
 	atexit(_dns_threat_cache_save_atexit);
 }
 
-static void _dns_threat_cache_save_to_file(void)
+static void _dns_threat_cache_save_to_file(int force)
 {
 	FILE *fp = NULL;
 	struct dns_threat_cache_entry *entry = NULL;
 	struct list_head *pos = NULL;
 	char tmp_file[DNS_MAX_PATH + 16];
 	int entry_count = 0;
+	int save_failed = 0;
+	char *buf = NULL;
+	size_t buf_len = 0;
+	size_t buf_cap = 0;
 
 	if (dns_conf.threat_intelligence_cache_enable == 0) {
 		return;
@@ -335,42 +429,139 @@ static void _dns_threat_cache_save_to_file(void)
 
 	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
 	pthread_mutex_lock(&dns_threat_cache_file_lock);
-	
-	/* Use temporary file to avoid truncating the cache file when there's nothing to write */
-	snprintf(tmp_file, sizeof(tmp_file), "%s.tmp", _dns_threat_cache_file());
-	fp = fopen(tmp_file, "w");
-	if (fp == NULL) {
+
+	/* Re-check threshold under lock so concurrent callers that both crossed the
+	   threshold don't each run a full O(N) rewrite. */
+	if (!force) {
+		unsigned long now = get_tick_count();
+		if (dns_threat_cache_append_since_save < _dns_threat_cache_compact_threshold() &&
+			(now - dns_threat_cache_last_save) < DNS_THREAT_CACHE_COMPACT_INTERVAL_MS) {
+			pthread_mutex_unlock(&dns_threat_cache_file_lock);
+			return;
+		}
+	}
+
+	/* Serialize the cache to an in-memory buffer while holding cache_lock.
+	   Disk I/O is then done after releasing cache_lock so concurrent cache
+	   reads/writes aren't blocked on file writes. */
+	pthread_mutex_lock(&dns_threat_cache_lock);
+	buf_cap = (size_t)dns_threat_cache_num * 64 + 4096;
+	buf = malloc(buf_cap);
+	if (buf == NULL) {
+		pthread_mutex_unlock(&dns_threat_cache_lock);
+		/* Mark as attempted so sustained memory pressure doesn't cause every
+		   cache_set to retry the malloc; data is still in the append log. */
+		dns_threat_cache_last_save = get_tick_count();
+		dns_threat_cache_append_since_save = 0;
 		pthread_mutex_unlock(&dns_threat_cache_file_lock);
+		tlog(TLOG_WARN, "threat cache compact alloc failed, retry on next interval");
 		return;
 	}
 
-	pthread_mutex_lock(&dns_threat_cache_lock);
+	time_t now_sec = time(NULL);
 	list_for_each(pos, &dns_threat_cache_list)
 	{
+		char line[64 + DNS_MAX_CNAME_LEN];
+		int len = 0;
+
 		entry = list_entry(pos, struct dns_threat_cache_entry, list);
-		if (_dns_threat_is_expired(entry->expired_time)) {
+		/* Inline expiry check to avoid 1.5M time() syscalls under cache_lock. */
+		if (entry->expired_time == 0 || entry->expired_time < now_sec) {
 			continue;
 		}
-		/* Only save MALICIOUS results to cache file */
-		if (entry->result != DNS_THREAT_QUERY_MALICIOUS) {
+		/* Persist both SAFE and MALICIOUS results so cache survives restart and
+		   avoids re-querying upstream threat intelligence for benign domains/IPs. */
+		if (entry->result == DNS_THREAT_QUERY_ERROR) {
 			continue;
 		}
-		fprintf(fp, "%d\t%d\t%lu\t%s\n", entry->is_ip, entry->result, (unsigned long)entry->expired_time, entry->ioc);
+
+		len = snprintf(line, sizeof(line), "%d\t%d\t%lu\t%s\n", entry->is_ip, entry->result,
+					   (unsigned long)entry->expired_time, entry->ioc);
+		if (len <= 0 || (size_t)len >= sizeof(line)) {
+			continue;
+		}
+		if (buf_len + (size_t)len > buf_cap) {
+			size_t new_cap = buf_cap * 2;
+			char *new_buf = NULL;
+			while (new_cap < buf_len + (size_t)len) {
+				new_cap *= 2;
+			}
+			new_buf = realloc(buf, new_cap);
+			if (new_buf == NULL) {
+				save_failed = 1;
+				break;
+			}
+			buf = new_buf;
+			buf_cap = new_cap;
+		}
+		memcpy(buf + buf_len, line, (size_t)len);
+		buf_len += (size_t)len;
 		entry_count++;
 	}
 	pthread_mutex_unlock(&dns_threat_cache_lock);
-	fclose(fp);
-	
-	/* Only replace cache file if we wrote some entries, otherwise keep the old file */
-	if (entry_count > 0) {
-		rename(tmp_file, _dns_threat_cache_file());
-	} else {
-		remove(tmp_file);
+
+	if (!save_failed && entry_count > 0) {
+		snprintf(tmp_file, sizeof(tmp_file), "%s.tmp", _dns_threat_cache_file());
+		fp = fopen(tmp_file, "w");
+		if (fp == NULL) {
+			save_failed = 1;
+		} else {
+			if (fwrite(buf, 1, buf_len, fp) != buf_len) {
+				save_failed = 1;
+			}
+			if (!save_failed && (fflush(fp) != 0 || ferror(fp))) {
+				save_failed = 1;
+			}
+			if (!save_failed && fsync(fileno(fp)) != 0) {
+				save_failed = 1;
+			}
+			fclose(fp);
+		}
+
+		if (save_failed) {
+			remove(tmp_file);
+			tlog(TLOG_WARN, "threat cache save failed, keep old cache file");
+		} else {
+			/* Close the append handle before rename so later appends reopen
+			   against the new inode; the stdio-buffered tail is a strict subset
+			   of what we just wrote into the replacement file. */
+			_dns_threat_cache_append_fp_close_locked();
+			if (rename(tmp_file, _dns_threat_cache_file()) != 0) {
+				remove(tmp_file);
+				tlog(TLOG_WARN, "rename threat cache file failed: %s", strerror(errno));
+			}
+		}
 	}
-	
+
+	free(buf);
+
 	dns_threat_cache_last_save = get_tick_count();
+	dns_threat_cache_append_since_save = 0;
 	pthread_mutex_unlock(&dns_threat_cache_file_lock);
 	tlog(TLOG_DEBUG, "threat cache saved to file, cache_size=%d, entries_saved=%d", dns_threat_cache_num, entry_count);
+}
+
+static void _dns_threat_cache_maybe_compact_file(void)
+{
+	unsigned long now;
+	unsigned long last_save = 0;
+	int append_since_save = 0;
+
+	if (dns_conf.threat_intelligence_cache_enable == 0) {
+		return;
+	}
+
+	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
+	pthread_mutex_lock(&dns_threat_cache_file_lock);
+	last_save = dns_threat_cache_last_save;
+	append_since_save = dns_threat_cache_append_since_save;
+	pthread_mutex_unlock(&dns_threat_cache_file_lock);
+
+	now = get_tick_count();
+	if (append_since_save >= _dns_threat_cache_compact_threshold() ||
+		(now - last_save) >= DNS_THREAT_CACHE_COMPACT_INTERVAL_MS) {
+		_dns_threat_cache_save_to_file(0);
+	}
 }
 
 static void _dns_threat_curl_global_init(void)
@@ -472,9 +663,13 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 	uint32_t key = _dns_threat_cache_key(ioc, is_ip);
 	struct dns_threat_cache_entry *entry = NULL;
 	struct dns_threat_cache_entry *oldest = NULL;
+	time_t expired_time = time(NULL) + _dns_threat_cache_ttl_ms() / 1000;
 
-	/* Cache all results in memory (both SAFE and MALICIOUS) for performance
-	   Only MALICIOUS results will be saved to cache file */
+	/* Cache all results (SAFE and MALICIOUS). Keep ERROR out of cache to avoid
+	   extending transient backend failures. */
+	if (result == DNS_THREAT_QUERY_ERROR) {
+		return;
+	}
 	
 	pthread_once(&dns_threat_cache_once, _dns_threat_cache_init);
 	/* Load cache file only once, not every set operation */
@@ -489,10 +684,13 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 		}
 
 		entry->result = result;
-			entry->expired_time = time(NULL) + _dns_threat_cache_ttl_ms() / 1000;
+		entry->expired_time = expired_time;
 		list_del(&entry->list);
 		list_add_tail(&entry->list, &dns_threat_cache_list);
 		pthread_mutex_unlock(&dns_threat_cache_lock);
+		/* Persist updated IOC immediately to avoid losing fresher result/TTL on restart. */
+		_dns_threat_cache_append_to_file(ioc, is_ip, result, expired_time);
+		_dns_threat_cache_maybe_compact_file();
 		return;
 	}
 
@@ -505,7 +703,7 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 	entry->key = key;
 	entry->is_ip = is_ip;
 	entry->result = result;
-	entry->expired_time = time(NULL) + _dns_threat_cache_ttl_ms() / 1000;
+	entry->expired_time = expired_time;
 	safe_strncpy(entry->ioc, ioc, sizeof(entry->ioc));
 	hash_add(dns_threat_cache, &entry->node, key);
 	list_add_tail(&entry->list, &dns_threat_cache_list);
@@ -521,10 +719,9 @@ static void _dns_threat_cache_set(const char *ioc, int is_ip, dns_threat_query_r
 	}
 	pthread_mutex_unlock(&dns_threat_cache_lock);
 
-	/* Only save to file when a MALICIOUS result is added (not for SAFE results) */
-	if (result == DNS_THREAT_QUERY_MALICIOUS) {
-		_dns_threat_cache_save_to_file();
-	}
+	/* New IOC append keeps miss path O(1); periodic compaction deduplicates file. */
+	_dns_threat_cache_append_to_file(ioc, is_ip, result, expired_time);
+	_dns_threat_cache_maybe_compact_file();
 }
 
 static int _dns_threat_is_whitelist(const char *response)
@@ -846,7 +1043,7 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 		return 0;
 	}
 
-	/* First pass: check cache for all IPs (cache only has MALICIOUS entries) */
+	/* First pass: check cache for all IPs (cache has SAFE and MALICIOUS entries). */
 	int query_num = 0;
 	query_ioc = malloc(sizeof(*query_ioc) * count);
 	query_map = malloc(sizeof(*query_map) * count);
@@ -857,7 +1054,6 @@ int _dns_server_threat_check_ips_batch(struct dns_request *request, const char *
 	for (int i = 0; i < count; i++) {
 		dns_threat_query_result cached = DNS_THREAT_QUERY_SAFE;
 		if (_dns_threat_cache_get(ioc[i], is_ip, &cached) == 0) {
-			/* Found in cache - must be MALICIOUS */
 			results[i] = cached;
 		} else {
 			/* Not in cache - need to query */
@@ -926,9 +1122,8 @@ dns_threat_query_result _dns_server_threat_check_domain(struct dns_request *requ
 	}
 
 	safe_strncpy_lower(domain, request->domain, sizeof(domain), NULL);
-	/* Check cache for malicious results */
+	/* Check cache for previous SAFE/MALICIOUS verdicts. */
 	if (_dns_threat_cache_get(query_domain, 0, &result) == 0) {
-		/* Found in cache - must be MALICIOUS */
 		return result;
 	}
 
@@ -945,7 +1140,7 @@ dns_threat_query_result _dns_server_threat_check_domain(struct dns_request *requ
 
 	result = _dns_server_threat_query_eval(result);
 	tlog(TLOG_DEBUG, "threat domain result: %s result=%d", query_domain, result);
-	/* Only cache malicious results */
+	/* Cache SAFE/MALICIOUS result to reduce upstream pressure. */
 	_dns_threat_cache_set(query_domain, 0, result);
 	return result;
 }

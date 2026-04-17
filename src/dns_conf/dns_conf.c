@@ -213,7 +213,7 @@ static struct config_item _config_item[] = {
 	CONF_INT("threat-intelligence-msearch-size", &dns_conf.threat_intelligence_msearch_size, 1, 2048),
 	CONF_YESNO("threat-intelligence-cache-enable", &dns_conf.threat_intelligence_cache_enable),
 	CONF_INT("threat-intelligence-cache-ttl", &dns_conf.threat_intelligence_cache_ttl, 1, 3600 * 24 * 30),
-	CONF_INT("threat-intelligence-cache-size", &dns_conf.threat_intelligence_cache_size, 1, 10000000),
+	CONF_INT("threat-intelligence-cache-size", &dns_conf.threat_intelligence_cache_size, 1, 1000000000),
 	CONF_CUSTOM("threat-intelligence-cache-file", _config_option_parser_filepath,
 				(char *)&dns_conf.threat_intelligence_cache_file),
 	CONF_CUSTOM("threat-intelligence-whitelist", _config_option_parser_filepath,
